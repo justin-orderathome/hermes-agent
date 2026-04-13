@@ -53,7 +53,7 @@ _HERMES_CORE_TOOLS = [
     # Clarifying questions
     "clarify",
     # Code execution + delegation
-    "execute_code", "delegate_task",
+    "execute_code", "delegate_task", "delegate_task_async", "check_async_task",
     # Cronjob management
     "cronjob",
     # Cross-platform messaging (gated on gateway running via check_fn)
@@ -187,8 +187,8 @@ TOOLSETS = {
     },
     
     "delegation": {
-        "description": "Spawn subagents with isolated context for complex subtasks",
-        "tools": ["delegate_task"],
+        "description": "Spawn subagents with isolated context for complex subtasks (sync and async)",
+        "tools": ["delegate_task", "delegate_task_async", "check_async_task"],
         "includes": []
     },
 

@@ -3542,6 +3542,31 @@ class GatewayRunner:
         if message_text is None:
             return
 
+        # Check for active async subagents and prepend status hint
+        try:
+            from tools.process_registry import process_registry
+            _async_tasks = process_registry._async_subagent_registry
+            _active_tasks = {
+                tid: t for tid, t in _async_tasks.items()
+                if t.get("status") == "running"
+            }
+            if _active_tasks:
+                _status_lines = []
+                for _tid, _t in _active_tasks.items():
+                    _dur = time.time() - _t.get("started_at", time.time())
+                    _goal_preview = (_t.get("goal") or "?")[:40]
+                    _status_lines.append(
+                        f"  • {_tid} ({_goal_preview}) — running ({_dur:.0f}s)"
+                    )
+                _status_hint = (
+                    "\n\n[SYSTEM: Active background tasks:\n"
+                    + "\n".join(_status_lines)
+                    + "\nUse check_async_task() to query status.]"
+                )
+                message_text = message_text + _status_hint
+        except Exception:
+            pass
+
         try:
             # Emit agent:start hook
             hook_ctx = {
@@ -3675,6 +3700,12 @@ class GatewayRunner:
                             logger.error("Watch notification injection error: %s", e2)
             except Exception as e:
                 logger.debug("Watch queue drain error: %s", e)
+
+            # Drain async subagent results (inject as synthetic messages)
+            try:
+                await self._drain_subagent_results(event)
+            except Exception as _dsr_err:
+                logger.error("Subagent result drain error: %s", _dsr_err)
 
             # NOTE: Dangerous command approvals are now handled inline by the
             # blocking gateway approval mechanism in tools/approval.py.  The agent
@@ -7171,6 +7202,135 @@ class GatewayRunner:
             await adapter.handle_message(synth_event)
         except Exception as e:
             logger.error("Watch notification injection error: %s", e)
+
+    async def _drain_subagent_results(self, original_event=None):
+        """Drain pending_subagent_results and inject as synthetic messages.
+
+        Called after each agent turn (alongside the watch-pattern drain above).
+        Each completed async subagent result is formatted as a [SYSTEM: ...]
+        message and injected via adapter.handle_message() to trigger a new
+        agent turn where the parent agent can digest the result.
+        """
+        from tools.process_registry import process_registry
+
+        results = process_registry.pending_subagent_results
+        if not results:
+            return
+
+        while results:
+            event_data = results.pop(0)
+
+            task_id = event_data.get("task_id", "unknown")
+            goal = event_data.get("goal", "")
+            status = event_data.get("status", "unknown")
+            summary = event_data.get("summary", "")
+            duration = event_data.get("duration_seconds", 0)
+            tokens = event_data.get("tokens", {})
+            model = event_data.get("model", "")
+
+            # Mark as consumed in registry
+            try:
+                from tools.delegate_tool import _read_cached_result, _cache_result
+                cached = _read_cached_result(task_id)
+                if cached:
+                    cached["consumed"] = True
+                    _cache_result(task_id, cached)
+            except Exception:
+                pass
+
+            # Determine injection strategy based on result length
+            summary_len = len(summary) if summary else 0
+
+            if summary_len <= 2000:
+                # Direct injection: full result
+                synth_text = (
+                    f"[SYSTEM: Async subagent task \"{task_id}\" {status}.\n"
+                    f"Goal: {goal}\n"
+                    f"Duration: {duration:.1f}s | "
+                    f"Tokens: {tokens.get('input', '?')}/{tokens.get('output', '?')}"
+                    f"{' | Model: ' + model if model else ''}\n"
+                    f"──────────────\n"
+                    f"{summary}]"
+                )
+            else:
+                # Large result: inject warning with summary preview
+                preview = summary[:500] + "..." if len(summary) > 500 else summary
+                synth_text = (
+                    f"[SYSTEM: Async subagent task \"{task_id}\" {status}.\n"
+                    f"Goal: {goal}\n"
+                    f"Duration: {duration:.1f}s | "
+                    f"Tokens: {tokens.get('input', '?')}/{tokens.get('output', '?')}\n"
+                    f"⚠️ Result is large ({summary_len} chars). Injecting may exceed context window.\n"
+                    f"Recommend: use check_async_task(task_id=\"{task_id}\") to retrieve full result.\n"
+                    f"──────────────\n"
+                    f"{preview}]"
+                )
+
+            # Build synthetic MessageEvent (same pattern as _run_process_watcher)
+            try:
+                from gateway.platforms.base import MessageEvent, MessageType
+                from gateway.session import SessionSource
+                from gateway.config import Platform
+
+                # Resolve routing info from event_data (stored by delegate_task_async)
+                platform_name = event_data.get("platform") or ""
+                chat_id = event_data.get("chat_id") or ""
+                thread_id = event_data.get("thread_id")
+                user_id = event_data.get("user_id") or ""
+                user_name = event_data.get("user_name") or ""
+
+                # Fallback to original event source if available
+                if original_event and hasattr(original_event, 'source'):
+                    _osrc = original_event.source
+                    if not platform_name:
+                        platform_name = getattr(_osrc, 'platform', '')
+                        if hasattr(platform_name, 'value'):
+                            platform_name = platform_name.value
+                    if not chat_id:
+                        chat_id = getattr(_osrc, 'chat_id', '')
+
+                # Find the adapter for this platform
+                adapter = None
+                try:
+                    _platform_enum = Platform(platform_name)
+                    for p, a in self.adapters.items():
+                        if p == _platform_enum:
+                            adapter = a
+                            break
+                except Exception:
+                    pass
+
+                if not adapter or not chat_id:
+                    logger.warning(
+                        "Cannot inject async subagent result %s: no adapter/chat_id "
+                        "(platform=%s, chat_id=%s)",
+                        task_id, platform_name, chat_id,
+                    )
+                    continue
+
+                _source = SessionSource(
+                    platform=_platform_enum,
+                    chat_id=chat_id,
+                    thread_id=thread_id or None,
+                    user_id=user_id or None,
+                    user_name=user_name or None,
+                )
+                synth_event = MessageEvent(
+                    text=synth_text,
+                    message_type=MessageType.TEXT,
+                    source=_source,
+                    internal=True,
+                )
+
+                # Inject → triggers new agent turn
+                await adapter.handle_message(synth_event)
+                logger.info(
+                    "Injected async subagent result %s (%s, %d chars)",
+                    task_id, status, summary_len,
+                )
+
+            except Exception as exc:
+                logger.error("Failed to inject async subagent result %s: %s", task_id, exc)
 
     async def _run_process_watcher(self, watcher: dict) -> None:
         """

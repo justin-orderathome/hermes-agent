@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 import os
 import threading
 import time
+import uuid as _uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional
 
@@ -30,11 +31,13 @@ from toolsets import TOOLSETS
 
 # Tools that children must never have access to
 DELEGATE_BLOCKED_TOOLS = frozenset([
-    "delegate_task",   # no recursive delegation
-    "clarify",         # no user interaction
-    "memory",          # no writes to shared MEMORY.md
-    "send_message",    # no cross-platform side effects
-    "execute_code",    # children should reason step-by-step, not write scripts
+    "delegate_task",        # no recursive delegation
+    "delegate_task_async",  # no recursive async delegation
+    "check_async_task",     # no checking from children
+    "clarify",              # no user interaction
+    "memory",               # no writes to shared MEMORY.md
+    "send_message",         # no cross-platform side effects
+    "execute_code",         # children should reason step-by-step, not write scripts
 ])
 
 # Build a description fragment listing toolsets available for subagents.
@@ -51,6 +54,12 @@ _TOOLSET_LIST_STR = ", ".join(f"'{n}'" for n in _SUBAGENT_TOOLSETS)
 
 _DEFAULT_MAX_CONCURRENT_CHILDREN = 3
 MAX_DEPTH = 2  # parent (0) -> child (1) -> grandchild rejected (2)
+
+# Async subagent directory for result caching
+_ASYNC_SUBAGENT_DIR = "async_subagent"
+_ASYNC_RESULT_MAX_DIRECT_INJECT = 2000  # chars; below this, inject directly
+_ASYNC_SUBAGENT_TIMEOUT = 600  # seconds; kill subagent after this
+_MAX_ASYNC_CONCURRENT = 3  # max simultaneous async subagents
 
 
 def _get_max_concurrent_children() -> int:
@@ -813,6 +822,308 @@ def delegate_task(
     }, ensure_ascii=False)
 
 
+def delegate_task_async(
+    goal: Optional[str] = None,
+    context: Optional[str] = None,
+    toolsets: Optional[List[str]] = None,
+    max_iterations: Optional[int] = None,
+    parent_agent=None,
+) -> str:
+    """
+    Non-blocking sub-agent delegation with result injection.
+    
+    Spawns a child agent in a background thread and returns immediately.
+    When the child completes, the result is written to a cache file and
+    queued for injection into the parent conversation via [SYSTEM: ...] message.
+    
+    In CLI mode (no gateway adapter), degrades to synchronous delegate_task.
+    """
+    if parent_agent is None:
+        return tool_error("delegate_task_async requires a parent agent context.")
+    
+    # CLI fallback: if no gateway session context, use synchronous delegate_task
+    from tools.process_registry import process_registry
+    has_gateway = bool(getattr(process_registry, "_gateway_session_env", None))
+    if not has_gateway:
+        logger.info("delegate_task_async: no gateway context, falling back to synchronous delegate_task")
+        return delegate_task(
+            goal=goal, context=context, toolsets=toolsets,
+            max_iterations=max_iterations, parent_agent=parent_agent,
+        )
+    
+    if not goal or not goal.strip():
+        return tool_error("delegate_task_async requires a 'goal'.")
+    
+    # Concurrency limit
+    active_count = sum(
+        1 for t in process_registry._async_subagent_registry.values()
+        if t.get("status") == "running"
+    )
+    if active_count >= _MAX_ASYNC_CONCURRENT:
+        return json.dumps({
+            "error": (
+                f"Max concurrent async subagents reached ({_MAX_ASYNC_CONCURRENT}). "
+                f"Currently running: {active_count}. Wait for a task to complete or "
+                f"use check_async_task() to monitor."
+            )
+        })
+    
+    # Depth limit (same as delegate_task)
+    depth = getattr(parent_agent, '_delegate_depth', 0)
+    if depth >= MAX_DEPTH:
+        return json.dumps({
+            "error": (
+                f"Delegation depth limit reached ({MAX_DEPTH}). "
+                "Subagents cannot spawn further subagents."
+            )
+        })
+    
+    # Load config and resolve credentials (same path as delegate_task)
+    cfg = _load_config()
+    default_max_iter = cfg.get("max_iterations", DEFAULT_MAX_ITERATIONS)
+    effective_max_iter = max_iterations or default_max_iter
+    
+    try:
+        creds = _resolve_delegation_credentials(cfg, parent_agent)
+    except ValueError as exc:
+        return tool_error(str(exc))
+    
+    # Generate task_id
+    task_id = f"async_{_uuid.uuid4().hex[:12]}"
+    
+    # Build child agent (thread-safe, on main thread)
+    import model_tools as _model_tools
+    _parent_tool_names = list(_model_tools._last_resolved_tool_names)
+    
+    try:
+        child = _build_child_agent(
+            task_index=0, goal=goal, context=context,
+            toolsets=toolsets, model=creds["model"],
+            max_iterations=effective_max_iter, parent_agent=parent_agent,
+            override_provider=creds["provider"], override_base_url=creds["base_url"],
+            override_api_key=creds["api_key"],
+            override_api_mode=creds["api_mode"],
+        )
+        child._delegate_saved_tool_names = _parent_tool_names
+    except Exception as exc:
+        return tool_error(f"Failed to build async subagent: {exc}")
+    finally:
+        _model_tools._last_resolved_tool_names = _parent_tool_names
+    
+    # Get gateway session env for injection
+    gw_env = getattr(process_registry, "_gateway_session_env", {})
+    
+    # Register in async subagent registry
+    registry_data = {
+        "task_id": task_id,
+        "goal": goal[:100],
+        "status": "running",
+        "started_at": time.time(),
+        "duration_seconds": 0,
+        "api_calls": 0,
+        "tokens": {"input": 0, "output": 0},
+    }
+    process_registry._async_subagent_registry[task_id] = registry_data
+    
+    # Background thread: run child, cache result, queue for injection
+    def _run_async():
+        child_start = time.monotonic()
+        try:
+            result = child.run_conversation(user_message=goal)
+            duration = round(time.monotonic() - child_start, 2)
+            summary = result.get("final_response") or ""
+            api_calls = result.get("api_calls", 0)
+            _input_tokens = getattr(child, "session_prompt_tokens", 0)
+            _output_tokens = getattr(child, "session_completion_tokens", 0)
+            _model = getattr(child, "model", None)
+            
+            result_data = {
+                "task_id": task_id,
+                "goal": goal,
+                "status": "completed",
+                "summary": summary,
+                "duration_seconds": duration,
+                "api_calls": api_calls,
+                "tokens": {
+                    "input": _input_tokens if isinstance(_input_tokens, (int, float)) else 0,
+                    "output": _output_tokens if isinstance(_output_tokens, (int, float)) else 0,
+                },
+                "model": _model if isinstance(_model, str) else None,
+                "consumed": False,
+                "platform": gw_env.get("platform"),
+                "chat_id": gw_env.get("chat_id"),
+                "thread_id": gw_env.get("thread_id"),
+                "user_id": gw_env.get("user_id"),
+                "user_name": gw_env.get("user_name"),
+            }
+            
+            # Cache result to file
+            _cache_result(task_id, result_data)
+            
+            # Update registry
+            registry_data["status"] = "completed"
+            registry_data["duration_seconds"] = duration
+            registry_data["api_calls"] = api_calls
+            registry_data["tokens"] = result_data["tokens"]
+            
+            # Queue for gateway injection
+            process_registry.pending_subagent_results.append(result_data)
+            
+        except Exception as exc:
+            duration = round(time.monotonic() - child_start, 2)
+            result_data = {
+                "task_id": task_id,
+                "goal": goal,
+                "status": "failed",
+                "summary": f"Error: {str(exc)}",
+                "duration_seconds": duration,
+                "api_calls": 0,
+                "tokens": {"input": 0, "output": 0},
+                "consumed": False,
+                "platform": gw_env.get("platform"),
+                "chat_id": gw_env.get("chat_id"),
+                "thread_id": gw_env.get("thread_id"),
+                "user_id": gw_env.get("user_id"),
+                "user_name": gw_env.get("user_name"),
+            }
+            _cache_result(task_id, result_data)
+            registry_data["status"] = "failed"
+            registry_data["duration_seconds"] = duration
+            registry_data["summary"] = str(exc)
+            process_registry.pending_subagent_results.append(result_data)
+            logger.exception(f"[async-subagent-{task_id}] failed")
+    
+    thread = threading.Thread(target=_run_async, daemon=True, name=f"async-subagent-{task_id}")
+    thread.start()
+    
+    # Timeout watcher: kill subagent if it exceeds _ASYNC_SUBAGENT_TIMEOUT
+    def _timeout_watcher():
+        if not thread.is_alive():
+            return
+        # Wait for timeout period
+        if thread.join(timeout=_ASYNC_SUBAGENT_TIMEOUT):
+            return  # Thread finished naturally
+        
+        # Thread still alive after timeout — mark as failed
+        if registry_data.get("status") == "running":
+            duration = round(time.monotonic() - child_start_global, 2)
+            registry_data["status"] = "timeout"
+            registry_data["duration_seconds"] = duration
+            
+            timeout_result = {
+                "task_id": task_id,
+                "goal": goal,
+                "status": "failed",
+                "summary": f"Async subagent timed out after {_ASYNC_SUBAGENT_TIMEOUT}s",
+                "duration_seconds": duration,
+                "api_calls": 0,
+                "tokens": {"input": 0, "output": 0},
+                "consumed": False,
+                "platform": gw_env.get("platform"),
+                "chat_id": gw_env.get("chat_id"),
+                "thread_id": gw_env.get("thread_id"),
+                "user_id": gw_env.get("user_id"),
+                "user_name": gw_env.get("user_name"),
+            }
+            _cache_result(task_id, timeout_result)
+            process_registry.pending_subagent_results.append(timeout_result)
+            logger.warning(f"[async-subagent-{task_id}] timed out after {_ASYNC_SUBAGENT_TIMEOUT}s")
+    
+    child_start_global = time.monotonic()
+    watcher = threading.Thread(target=_timeout_watcher, daemon=True, name=f"async-timeout-{task_id}")
+    watcher.start()
+    
+    return json.dumps({
+        "task_id": task_id,
+        "status": "dispatched",
+        "message": f"Sub-agent dispatched for: {goal[:80]}{'...' if len(goal) > 80 else ''}",
+    }, ensure_ascii=False)
+
+
+def _cache_result(task_id: str, result_data: dict) -> str:
+    """Cache async subagent result to file. Returns the cache file path."""
+    try:
+        from hermes_constants import get_hermes_home
+        cache_dir = os.path.join(get_hermes_home(), _ASYNC_SUBAGENT_DIR, task_id)
+        os.makedirs(cache_dir, exist_ok=True)
+        
+        cache_path = os.path.join(cache_dir, "result.json")
+        with open(cache_path, "w", encoding="utf-8") as f:
+            json.dump(result_data, f, ensure_ascii=False, indent=2)
+        
+        # Also write human-readable result
+        summary_path = os.path.join(cache_dir, "result.md")
+        summary = result_data.get("summary", "")
+        with open(summary_path, "w", encoding="utf-8") as f:
+            f.write(f"# Async Subagent Result: {task_id}\n\n")
+            f.write(f"**Goal**: {result_data.get('goal', 'N/A')}\n")
+            f.write(f"**Status**: {result_data.get('status', 'N/A')}\n")
+            f.write(f"**Duration**: {result_data.get('duration_seconds', 0):.1f}s\n")
+            f.write(f"**API Calls**: {result_data.get('api_calls', 0)}\n")
+            f.write(f"\n---\n\n{summary}\n")
+        
+        return cache_path
+    except Exception as exc:
+        logger.error(f"Failed to cache async subagent result: {exc}")
+        return ""
+
+
+def _read_cached_result(task_id: str) -> Optional[dict]:
+    """Read a cached async subagent result."""
+    try:
+        from hermes_constants import get_hermes_home
+        cache_path = os.path.join(get_hermes_home(), _ASYNC_SUBAGENT_DIR, task_id, "result.json")
+        if os.path.exists(cache_path):
+            with open(cache_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as exc:
+        logger.error(f"Failed to read cached async subagent result: {exc}")
+    return None
+
+
+def check_async_task(
+    task_id: Optional[str] = None,
+    parent_agent=None,
+) -> str:
+    """
+    Check the status of an async subagent task.
+    
+    If task_id is provided, returns details for that specific task.
+    If task_id is omitted, returns a list of all async subagent tasks.
+    """
+    from tools.process_registry import process_registry
+    
+    registry = process_registry._async_subagent_registry
+    
+    if task_id:
+        # Specific task
+        # Check live registry first
+        if task_id in registry:
+            entry = dict(registry[task_id])
+            return json.dumps(entry, ensure_ascii=False)
+        
+        # Check cached results
+        cached = _read_cached_result(task_id)
+        if cached:
+            return json.dumps(cached, ensure_ascii=False)
+        
+        return tool_error(f"No async subagent found with task_id: {task_id}")
+    else:
+        # List all tasks
+        tasks = []
+        for tid, entry in registry.items():
+            tasks.append({
+                "task_id": tid,
+                "goal": entry.get("goal", ""),
+                "status": entry.get("status", ""),
+                "duration_seconds": entry.get("duration_seconds", 0),
+            })
+        return json.dumps({
+            "tasks": tasks,
+            "total": len(tasks),
+        }, ensure_ascii=False)
+
+
 def _resolve_child_credential_pool(effective_provider: Optional[str], parent_agent):
     """Resolve a credential pool for the child agent.
 
@@ -1082,6 +1393,84 @@ DELEGATE_TASK_SCHEMA = {
 }
 
 
+DELEGATE_TASK_ASYNC_SCHEMA = {
+    "name": "delegate_task_async",
+    "description": (
+        "Dispatch a sub-agent task in the background without blocking the current conversation. "
+        "The sub-agent runs independently, and its result will be automatically injected back "
+        "into this conversation when complete. Use this when the user wants you to research "
+        "something while continuing the current discussion.\n\n"
+        "IMPORTANT:\n"
+        "- The sub-agent has no access to current conversation history — provide all needed "
+        "context via the 'context' parameter.\n"
+        "- Results are cached to disk and injected when ready. If the result is large (>2000 "
+        "chars), a warning is injected instead, and you can retrieve the full result later "
+        "with check_async_task(task_id).\n"
+        "- In CLI mode (no gateway), this falls back to synchronous delegate_task.\n"
+        "- Subagents CANNOT call: delegate_task, delegate_task_async, check_async_task, "
+        "clarify, memory, send_message, execute_code."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "goal": {
+                "type": "string",
+                "description": (
+                    "What the sub-agent should accomplish. Must be self-contained — "
+                    "the sub-agent has no access to current conversation history."
+                ),
+            },
+            "context": {
+                "type": "string",
+                "description": (
+                    "Background information the sub-agent needs from the current discussion. "
+                    "Include any relevant context so the sub-agent can work autonomously."
+                ),
+            },
+            "toolsets": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Toolsets to enable for the sub-agent. Default: inherits parent's toolsets. "
+                    f"Available toolsets: {_TOOLSET_LIST_STR}. "
+                    "Common patterns: ['terminal', 'file'] for code work, ['web'] for research."
+                ),
+            },
+            "max_iterations": {
+                "type": "integer",
+                "description": "Max tool-calling turns per sub-agent. Default: 50.",
+            },
+        },
+        "required": ["goal"],
+    },
+}
+
+CHECK_ASYNC_TASK_SCHEMA = {
+    "name": "check_async_task",
+    "description": (
+        "Check the status of a dispatched async subagent task. "
+        "If task_id is provided, returns details for that task. "
+        "If task_id is omitted, lists all async subagent tasks and their statuses.\n\n"
+        "Use this when the user asks about a background task's progress, or when you "
+        "need to retrieve the full result of a completed task that was too large for "
+        "direct injection."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": (
+                    "The task_id returned by delegate_task_async. "
+                    "Omit to list all async subagent tasks."
+                ),
+            },
+        },
+        "required": [],
+    },
+}
+
+
 # --- Registry ---
 from tools.registry import registry, tool_error
 
@@ -1100,4 +1489,29 @@ registry.register(
         parent_agent=kw.get("parent_agent")),
     check_fn=check_delegate_requirements,
     emoji="🔀",
+)
+
+registry.register(
+    name="delegate_task_async",
+    toolset="delegation",
+    schema=DELEGATE_TASK_ASYNC_SCHEMA,
+    handler=lambda args, **kw: delegate_task_async(
+        goal=args.get("goal"),
+        context=args.get("context"),
+        toolsets=args.get("toolsets"),
+        max_iterations=args.get("max_iterations"),
+        parent_agent=kw.get("parent_agent")),
+    check_fn=check_delegate_requirements,
+    emoji="🚀",
+)
+
+registry.register(
+    name="check_async_task",
+    toolset="delegation",
+    schema=CHECK_ASYNC_TASK_SCHEMA,
+    handler=lambda args, **kw: check_async_task(
+        task_id=args.get("task_id"),
+        parent_agent=kw.get("parent_agent")),
+    check_fn=check_delegate_requirements,
+    emoji="📋",
 )

@@ -140,6 +140,15 @@ class ProcessRegistry:
         # via wait/poll/log.  Drain loops skip notifications for these.
         self._completion_consumed: set = set()
 
+        # Async subagent result queue (gateway reads after agent run)
+        self.pending_subagent_results: List[Dict[str, Any]] = []
+        
+        # Registry of all async subagents (for status tracking)
+        self._async_subagent_registry: Dict[str, Dict[str, Any]] = {}
+        
+        # Gateway session env (set by terminal_tool or gateway)
+        self._gateway_session_env: Dict[str, str] = {}
+
     @staticmethod
     def _clean_shell_noise(text: str) -> str:
         """Strip shell startup warnings from the beginning of output."""

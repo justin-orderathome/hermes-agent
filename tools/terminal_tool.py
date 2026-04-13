@@ -1417,6 +1417,15 @@ def terminal_tool(
                             "notify_on_complete": True,
                         })
 
+                        # Store gateway session env for async subagent injection
+                        process_registry._gateway_session_env = {
+                            "platform": _gw_platform,
+                            "chat_id": _gw_chat_id,
+                            "thread_id": _gw_thread_id,
+                            "user_id": _gw_user_id,
+                            "user_name": _gw_user_name,
+                        }
+
                 # Set watch patterns for output monitoring
                 if watch_patterns and background:
                     proc_session.watch_patterns = list(watch_patterns)
