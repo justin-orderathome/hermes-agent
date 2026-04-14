@@ -6948,6 +6948,21 @@ class AIAgent:
                 max_iterations=function_args.get("max_iterations"),
                 parent_agent=self,
             )
+        elif function_name == "delegate_task_async":
+            from tools.delegate_tool import delegate_task_async as _delegate_task_async
+            return _delegate_task_async(
+                goal=function_args.get("goal"),
+                context=function_args.get("context"),
+                toolsets=function_args.get("toolsets"),
+                max_iterations=function_args.get("max_iterations"),
+                parent_agent=self,
+            )
+        elif function_name == "check_async_task":
+            from tools.delegate_tool import check_async_task as _check_async_task
+            return _check_async_task(
+                task_id=function_args.get("task_id"),
+                parent_agent=self,
+            )
         else:
             return handle_function_call(
                 function_name, function_args, effective_task_id,
@@ -7339,6 +7354,26 @@ class AIAgent:
                         spinner.stop(cute_msg)
                     elif self._should_emit_quiet_tool_messages():
                         self._vprint(f"  {cute_msg}")
+            elif function_name == "delegate_task_async":
+                from tools.delegate_tool import delegate_task_async as _delegate_task_async
+                goal_preview = (function_args.get("goal") or "")[:30]
+                if self._should_emit_quiet_tool_messages():
+                    self._vprint(f"  🚀 async dispatched: {goal_preview}")
+                function_result = _delegate_task_async(
+                    goal=function_args.get("goal"),
+                    context=function_args.get("context"),
+                    toolsets=function_args.get("toolsets"),
+                    max_iterations=function_args.get("max_iterations"),
+                    parent_agent=self,
+                )
+                tool_duration = time.time() - tool_start_time
+            elif function_name == "check_async_task":
+                from tools.delegate_tool import check_async_task as _check_async_task
+                function_result = _check_async_task(
+                    task_id=function_args.get("task_id"),
+                    parent_agent=self,
+                )
+                tool_duration = time.time() - tool_start_time
             elif self._context_engine_tool_names and function_name in self._context_engine_tool_names:
                 # Context engine tools (lcm_grep, lcm_describe, lcm_expand, etc.)
                 spinner = None

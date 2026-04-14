@@ -841,11 +841,14 @@ def delegate_task_async(
     if parent_agent is None:
         return tool_error("delegate_task_async requires a parent agent context.")
     
-    # CLI fallback: if no gateway session context, use synchronous delegate_task
+    # Detect gateway context: parent_agent.platform is set by gateway (discord, telegram, etc.)
+    # CLI sets platform="cli" or None. ContextVars don't propagate to run_in_executor threads,
+    # so we can't use get_session_env here — fall back to os.environ for routing info.
     from tools.process_registry import process_registry
-    has_gateway = bool(getattr(process_registry, "_gateway_session_env", None))
+    _gw_platform = getattr(parent_agent, "platform", "") or ""
+    has_gateway = _gw_platform not in ("", "cli", None)
     if not has_gateway:
-        logger.info("delegate_task_async: no gateway context, falling back to synchronous delegate_task")
+        logger.info("delegate_task_async: no gateway context (platform=%s), falling back to synchronous delegate_task", _gw_platform)
         return delegate_task(
             goal=goal, context=context, toolsets=toolsets,
             max_iterations=max_iterations, parent_agent=parent_agent,
@@ -910,8 +913,16 @@ def delegate_task_async(
     finally:
         _model_tools._last_resolved_tool_names = _parent_tool_names
     
-    # Get gateway session env for injection
-    gw_env = getattr(process_registry, "_gateway_session_env", {})
+    # Get gateway session env for injection.
+    # ContextVars don't propagate to run_in_executor threads, so read from os.environ
+    # (gateway's run_sync sets HERMES_SESSION_KEY at L7898; other vars may be set similarly).
+    gw_env = {
+        "platform": _gw_platform,
+        "chat_id": os.environ.get("HERMES_SESSION_CHAT_ID", ""),
+        "thread_id": os.environ.get("HERMES_SESSION_THREAD_ID", ""),
+        "user_id": os.environ.get("HERMES_SESSION_USER_ID", ""),
+        "user_name": os.environ.get("HERMES_SESSION_USER_NAME", ""),
+    }
     
     # Register in async subagent registry
     registry_data = {
