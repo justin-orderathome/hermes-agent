@@ -2051,6 +2051,7 @@ def _resolve_task_provider_model(
     cfg_model = None
     cfg_base_url = None
     cfg_api_key = None
+    cfg_key_env = None
     cfg_api_mode = None
 
     if task:
@@ -2068,6 +2069,11 @@ def _resolve_task_provider_model(
         cfg_model = str(task_config.get("model", "")).strip() or None
         cfg_base_url = str(task_config.get("base_url", "")).strip() or None
         cfg_api_key = str(task_config.get("api_key", "")).strip() or None
+        cfg_key_env = (
+            str(task_config.get("key_env", "")).strip()
+            or str(task_config.get("api_key_env", "")).strip()
+            or None
+        )
         cfg_api_mode = str(task_config.get("api_mode", "")).strip() or None
 
     resolved_model = model or cfg_model
@@ -2081,7 +2087,10 @@ def _resolve_task_provider_model(
     if task:
         # Config.yaml is the primary source for per-task overrides.
         if cfg_base_url:
-            return "custom", resolved_model, cfg_base_url, cfg_api_key, resolved_api_mode
+            resolved_cfg_key = cfg_api_key
+            if not resolved_cfg_key and cfg_key_env:
+                resolved_cfg_key = os.getenv(cfg_key_env, "").strip() or None
+            return "custom", resolved_model, cfg_base_url, resolved_cfg_key, resolved_api_mode
         if cfg_provider and cfg_provider != "auto":
             return cfg_provider, resolved_model, None, None, resolved_api_mode
 

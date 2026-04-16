@@ -870,6 +870,27 @@ class TestTaskSpecificOverrides:
         assert mock_openai.call_args.kwargs["base_url"] == "http://localhost:3456/v1"
         assert mock_openai.call_args.kwargs["api_key"] == "config-key"
 
+    def test_task_direct_endpoint_uses_key_env_when_api_key_missing(self, monkeypatch, tmp_path):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir(parents=True, exist_ok=True)
+        (hermes_home / "config.yaml").write_text(
+            """auxiliary:
+  vision:
+    base_url: https://api.groq.com/openai/v1
+    key_env: GROQ_API_KEY
+    model: llama-3.2-90b-vision-preview
+"""
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("GROQ_API_KEY", "groq-env-key")
+
+        with patch("agent.auxiliary_client.OpenAI") as mock_openai:
+            client, model = get_text_auxiliary_client("vision")
+
+        assert model == "llama-3.2-90b-vision-preview"
+        assert mock_openai.call_args.kwargs["base_url"] == "https://api.groq.com/openai/v1"
+        assert mock_openai.call_args.kwargs["api_key"] == "groq-env-key"
+
     def test_task_without_override_uses_auto(self, monkeypatch):
         """A task with no provider env var falls through to auto chain."""
         monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
