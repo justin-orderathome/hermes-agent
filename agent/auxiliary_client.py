@@ -2134,6 +2134,70 @@ def _is_anthropic_compat_endpoint(provider: str, base_url: str) -> bool:
     return "/anthropic" in url_lower
 
 
+def _is_groq_endpoint(provider: str, base_url: str) -> bool:
+    """Detect if an endpoint is Groq.
+
+    Groq vision API only accepts JPEG base64 images; PNG must be converted.
+    """
+    if provider and "groq" in provider.lower():
+        return True
+    url_lower = (base_url or "").lower()
+    return "groq.com" in url_lower or "groq" in url_lower.split(".")[0]
+
+
+def _convert_png_to_jpeg_for_groq(messages: list) -> list:
+    """Convert PNG base64 data-URIs to JPEG for Groq compatibility.
+
+    Walks messages looking for ``image_url`` blocks with ``data:image/png;base64,...``
+    URLs, decodes the PNG via Pillow, converts to RGB (drops alpha), re-encodes as
+    JPEG (quality=85), and replaces the data-URI in-place.
+
+    On any conversion failure the original PNG is left untouched (transparent fallback).
+    """
+    try:
+        from PIL import Image
+        import io
+    except ImportError:
+        logger.warning("Pillow not available — skipping PNG→JPEG conversion for Groq")
+        return messages
+
+    converted = []
+    for msg in messages:
+        content = msg.get("content")
+        if not isinstance(content, list):
+            converted.append(msg)
+            continue
+        new_content = []
+        changed = False
+        for block in content:
+            if block.get("type") == "image_url":
+                image_url_val = (block.get("image_url") or {}).get("url", "")
+                if image_url_val.startswith("data:image/png;base64,"):
+                    try:
+                        b64data = image_url_val.split(",", 1)[1]
+                        png_bytes = __import__("base64").b64decode(b64data)
+                        img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
+                        buf = io.BytesIO()
+                        img.save(buf, format="JPEG", quality=85)
+                        jpeg_b64 = __import__("base64").b64encode(buf.getvalue()).decode("ascii")
+                        new_content.append({
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/jpeg;base64,{jpeg_b64}"},
+                        })
+                        changed = True
+                        logger.debug("Converted PNG→JPEG for Groq (%d→%d bytes)",
+                                     len(png_bytes), buf.tell())
+                    except Exception as exc:
+                        logger.warning("PNG→JPEG conversion failed, keeping original PNG: %s", exc)
+                        new_content.append(block)
+                else:
+                    new_content.append(block)
+            else:
+                new_content.append(block)
+        converted.append({**msg, "content": new_content} if changed else msg)
+    return converted
+
+
 def _convert_openai_images_to_anthropic(messages: list) -> list:
     """Convert OpenAI ``image_url`` content blocks to Anthropic ``image`` blocks.
 
@@ -2379,6 +2443,10 @@ def call_llm(
     if _is_anthropic_compat_endpoint(resolved_provider, _client_base):
         kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
 
+    # Convert PNG→JPEG for Groq (Groq vision API only accepts JPEG)
+    if _is_groq_endpoint(resolved_provider, _client_base):
+        kwargs["messages"] = _convert_png_to_jpeg_for_groq(kwargs["messages"])
+
     # Handle max_tokens vs max_completion_tokens retry, then payment fallback.
     try:
         return _validate_llm_response(
@@ -2571,6 +2639,10 @@ async def async_call_llm(
     _client_base = str(getattr(client, "base_url", "") or "")
     if _is_anthropic_compat_endpoint(resolved_provider, _client_base):
         kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
+
+    # Convert PNG→JPEG for Groq (Groq vision API only accepts JPEG)
+    if _is_groq_endpoint(resolved_provider, _client_base):
+        kwargs["messages"] = _convert_png_to_jpeg_for_groq(kwargs["messages"])
 
     try:
         return _validate_llm_response(
