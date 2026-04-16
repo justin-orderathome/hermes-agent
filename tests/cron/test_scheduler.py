@@ -874,6 +874,44 @@ class TestRunJobPerJobOverrides:
         assert mock_agent_cls.call_args.kwargs["model"] == "perplexity/sonar-pro"
         fake_db.close.assert_called_once()
 
+    def test_job_model_dict_uses_inner_model_string(self, tmp_path):
+        job = {
+            "id": "dict-model-job",
+            "name": "dict-model",
+            "prompt": "hello",
+            "model": {
+                "provider": "openrouter",
+                "model": "anthropic/claude-sonnet-4",
+            },
+        }
+
+        fake_db = MagicMock()
+        fake_runtime = {
+            "provider": "openrouter",
+            "api_mode": "chat_completions",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key": "***",
+        }
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("dotenv.load_dotenv"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch("hermes_cli.runtime_provider.resolve_runtime_provider", return_value=fake_runtime), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+
+            success, output, final_response, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        assert final_response == "ok"
+        assert "ok" in output
+        assert mock_agent_cls.call_args.kwargs["model"] == "anthropic/claude-sonnet-4"
+        fake_db.close.assert_called_once()
+
 
 class TestRunJobSkillBacked:
     def test_run_job_loads_skill_and_disables_recursive_cron_tools(self, tmp_path):
