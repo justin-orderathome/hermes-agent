@@ -627,7 +627,14 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             if delivery_target.get("thread_id") is not None:
                 os.environ["HERMES_CRON_AUTO_DELIVER_THREAD_ID"] = str(delivery_target["thread_id"])
 
-        model = job.get("model") or os.getenv("HERMES_MODEL") or ""
+        _model_raw = job.get("model")
+        if isinstance(_model_raw, dict):
+            # When the job model is specified as {"provider": "...", "model": "..."},
+            # extract the model name string. Provider/base_url are handled separately
+            # by resolve_runtime_provider below.
+            model = _model_raw.get("model", "") or os.getenv("HERMES_MODEL") or ""
+        else:
+            model = _model_raw or os.getenv("HERMES_MODEL") or ""
 
         # Load config.yaml for model, reasoning, prefill, toolsets, provider routing
         _cfg = {}
