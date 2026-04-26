@@ -13,6 +13,7 @@ Built-in TTS providers:
 - NeuTTS (local, free, no API key): On-device TTS via neutts
 - KittenTTS (local, free, no API key): On-device 25MB model
 - Piper (local, free, no API key): OHF-Voice/piper1-gpl neural VITS, 44 languages
+- IndexTTS2 (local, self-hosted): Voice cloning TTS via REST API, needs Docker service running
 
 Custom command providers:
 - Users can declare any number of named providers with ``type: command``
@@ -190,6 +191,8 @@ DEFAULT_XAI_BASE_URL = "https://api.x.ai/v1"
 DEFAULT_GEMINI_TTS_MODEL = "gemini-2.5-flash-preview-tts"
 DEFAULT_GEMINI_TTS_VOICE = "Kore"
 DEFAULT_GEMINI_TTS_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
+DEFAULT_INDEXTTS2_BASE_URL = "http://localhost:8007"
+DEFAULT_INDEXTTS2_SAMPLE_RATE = 22050
 # PCM output specs for Gemini TTS (fixed by the API)
 GEMINI_TTS_SAMPLE_RATE = 24000
 GEMINI_TTS_CHANNELS = 1
@@ -219,6 +222,7 @@ PROVIDER_MAX_TEXT_LENGTH: Dict[str, int] = {
     "neutts": 2000,       # local model, quality falls off on long text
     "kittentts": 2000,    # local 25MB model
     "piper": 5000,        # local VITS model, phoneme-based; practical cap
+    "indextts2": 50,      # ~50 Chinese chars per segment; long text needs external chunking
 }
 
 # ElevenLabs caps vary by model_id. https://elevenlabs.io/docs/overview/models
@@ -1832,6 +1836,109 @@ def _generate_kittentts(text: str, output_path: str, tts_config: Dict[str, Any])
 
 
 # ===========================================================================
+# Provider: IndexTTS2 (local, self-hosted REST API)
+# ===========================================================================
+def _generate_indextts2(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
+    """
+    Generate audio using a local IndexTTS2 service (REST API).
+
+    IndexTTS2 runs as a self-hosted HTTP service (typically Docker on port 8007).
+    Synthesis is a two-step process:
+      1. POST /synthesize  →  returns JSON metadata with a line_id
+      2. GET /download/{line_id}  →  returns WAV binary stream
+
+    The WAV output (22050 Hz) is converted to MP3 via ffmpeg if needed.
+
+    Args:
+        text: Text to convert (≤50 Chinese chars recommended).
+        output_path: Where to save the audio file.
+        tts_config: TTS config dict.
+
+    Returns:
+        Path to the saved audio file.
+    """
+    import requests
+
+    idx_config = tts_config.get("indextts2", {})
+    base_url = str(
+        idx_config.get("base_url") or DEFAULT_INDEXTTS2_BASE_URL
+    ).strip().rstrip("/")
+    spk_audio_prompt = str(idx_config.get("spk_audio_prompt", "")).strip()
+    use_emo_text = bool(idx_config.get("use_emo_text", True))
+    emo_alpha = float(idx_config.get("emo_alpha", 0.0))
+
+    if not spk_audio_prompt:
+        raise ValueError(
+            "IndexTTS2 requires 'tts.indextts2.spk_audio_prompt' in config.yaml. "
+            "Set it to the path of a 3-10s clean reference audio file."
+        )
+
+    # Generate a unique line_id for this synthesis
+    line_id = f"hermes_{uuid.uuid4().hex[:8]}"
+
+    # Step 1: POST /synthesize
+    payload = {
+        "text": text,
+        "spk_audio_prompt": spk_audio_prompt,
+        "line_id": line_id,
+        "use_emo_text": use_emo_text,
+        "emo_alpha": emo_alpha,
+    }
+
+    logger.info("IndexTTS2: synthesizing '%s' (line_id=%s)", text[:30], line_id)
+    resp = requests.post(
+        f"{base_url}/synthesize",
+        json=payload,
+        timeout=120,
+    )
+    resp.raise_for_status()
+    meta = resp.json()
+    actual_line_id = meta.get("line_id", line_id)
+
+    # Step 2: GET /download/{line_id} → WAV binary
+    dl_resp = requests.get(
+        f"{base_url}/download/{actual_line_id}",
+        timeout=60,
+    )
+    dl_resp.raise_for_status()
+
+    # Save the WAV data, then convert to target format if needed
+    if output_path.endswith(".wav"):
+        with open(output_path, "wb") as f:
+            f.write(dl_resp.content)
+    else:
+        # Write temp WAV, then convert to MP3 via ffmpeg
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            tmp.write(dl_resp.content)
+            tmp_wav = tmp.name
+        try:
+            ffmpeg = shutil.which("ffmpeg")
+            if ffmpeg:
+                conv_cmd = [ffmpeg, "-i", tmp_wav, "-y", "-loglevel", "error", output_path]
+                subprocess.run(conv_cmd, check=True, timeout=30)
+            else:
+                # No ffmpeg — save as WAV with the expected filename
+                os.rename(tmp_wav, output_path if output_path.endswith(".wav") else output_path + ".wav")
+        finally:
+            if os.path.exists(tmp_wav):
+                os.remove(tmp_wav)
+
+    logger.info("IndexTTS2: saved to %s", output_path)
+    return output_path
+
+
+def _check_indextts2_available(base_url: str = None) -> bool:
+    """Check if IndexTTS2 service is reachable."""
+    import requests
+    url = (base_url or DEFAULT_INDEXTTS2_BASE_URL).rstrip("/") + "/health"
+    try:
+        resp = requests.get(url, timeout=5)
+        return resp.status_code == 200
+    except Exception:
+        return False
+
+
+# ===========================================================================
 # Main tool function
 # ===========================================================================
 def text_to_speech_tool(
@@ -2037,6 +2144,16 @@ def text_to_speech_tool(
                 }, ensure_ascii=False)
             logger.info("Generating speech with Piper (local)...")
             _generate_piper_tts(text, file_str, tts_config)
+
+        elif provider == "indextts2":
+            if not _check_indextts2_available():
+                return json.dumps({
+                    "success": False,
+                    "error": "IndexTTS2 provider selected but the service is not reachable. "
+                             "Ensure the IndexTTS2 Docker container is running (default: http://localhost:8007)."
+                }, ensure_ascii=False)
+            logger.info("Generating speech with IndexTTS2 (local)...")
+            _generate_indextts2(text, file_str, tts_config)
 
         else:
             # Default: Edge TTS (free), with NeuTTS as local fallback
